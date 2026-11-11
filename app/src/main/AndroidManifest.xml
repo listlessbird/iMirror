@@ -38,6 +38,10 @@
     <!-- Foreground service notification (Android 13+ requires runtime grant) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Wake the TV and open the UI when a sender connects while the app is closed/asleep -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
     <!--
         Declare this app as a TV app (leanback).
         Required for the app to appear in the TV launcher.

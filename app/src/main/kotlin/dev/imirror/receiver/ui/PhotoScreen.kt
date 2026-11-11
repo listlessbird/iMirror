@@ -23,6 +23,8 @@ class PhotoScreen @JvmOverloads constructor(
     }
 
     init {
+        // Hold the screen on only while a photo is shown.
+        keepScreenOn = true
         setBackgroundColor(android.graphics.Color.BLACK)
         addView(
             imageView,

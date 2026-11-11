@@ -78,3 +78,6 @@ device-test-logs/
 
 # Profiling
 *.hprof
+
+# Local research notes (not published)
+docs/research/

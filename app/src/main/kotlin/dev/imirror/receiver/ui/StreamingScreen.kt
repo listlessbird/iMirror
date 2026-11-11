@@ -78,6 +78,8 @@ class StreamingScreen @JvmOverloads constructor(
     }
 
     init {
+        // Hold the screen on only while this view is visible, i.e. while mirroring.
+        keepScreenOn = true
         // Black backing so the letterbox/pillarbox bars (when the video is sized to its aspect ratio
         // and doesn't fill 16:9) are black — without this, those margins are transparent and the home
         // menu shows through behind the streaming overlay. The SurfaceView punches its own hole on top.

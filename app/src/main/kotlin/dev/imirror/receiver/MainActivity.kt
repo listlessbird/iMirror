@@ -96,6 +96,17 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Let an incoming connection (see MirrorService.bringUiToFront) light up a sleeping TV.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        } else {
+            @Suppress("DEPRECATION")
+            window.addFlags(
+                android.view.WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                    android.view.WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+            )
+        }
         setContentView(R.layout.activity_main)
 
         Timber.d("MainActivity created")
@@ -134,14 +145,13 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        // A user-initiated exit (Back out of the app) should end any active mirror — closing the
-        // service stops the receiver, which drops the RTSP connection so the sender stops mirroring
-        // too. isFinishing distinguishes a real exit from a config-change recreation (where the
-        // service must keep running). Backgrounding via Home goes through onStop only (no destroy),
-        // so the receiver keeps advertising for a quick return.
+        // A user-initiated exit (Back out of the app) should end any active mirror — restarting the
+        // receivers drops the RTSP connection so the sender stops mirroring too, while the service
+        // keeps advertising so the next connection reopens this activity (MirrorService.bringUiToFront).
+        // isFinishing distinguishes a real exit from a config-change recreation.
         if (isFinishing) {
-            Timber.d("MainActivity finishing — stopping service so mirroring doesn't linger")
-            ServiceController.stop(this)
+            Timber.d("MainActivity finishing — ending session, receiver stays available")
+            ServiceController.restart(this)
         } else {
             Timber.d("MainActivity destroyed (recreation) — leaving service running")
         }

@@ -10,6 +10,7 @@ import android.content.Intent
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import dev.imirror.receiver.MainActivity
 import dev.imirror.receiver.R
@@ -115,15 +116,42 @@ class MirrorService : Service() {
     override fun onBind(intent: Intent?): IBinder = binder
 
     /**
-     * The app was swiped away from recents. Cleanly stop all receivers (which closes the RTSP
-     * connection so an active mirror ends on the sender too) and stop the service — don't let
-     * START_STICKY silently resurrect it as a zombie that keeps advertising/streaming invisibly.
+     * The app was swiped away from recents. Restart the receivers (which closes the RTSP
+     * connection so an active mirror ends on the sender too) but keep advertising: the next
+     * connection wakes the TV and reopens the UI via [bringUiToFront], so nothing streams invisibly.
      */
     override fun onTaskRemoved(rootIntent: Intent?) {
-        Logger.i("App task removed — stopping receivers + service")
-        stopReceivers()
-        stopSelf()
+        Logger.i("App task removed — restarting receivers, staying available")
+        serviceScope.launch { restartReceivers() }
         super.onTaskRemoved(rootIntent)
+    }
+
+    /**
+     * Wakes the TV and brings [MainActivity] to the front so the sender's video, photo or PIN
+     * has a screen to land on even when the app is closed or the TV is asleep. The mirror
+     * pipeline already waits for the activity's Surface, so it attaches once this opens.
+     * Background activity starts rely on the SYSTEM_ALERT_WINDOW grant.
+     */
+    private fun bringUiToFront() {
+        val power = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (!power.isInteractive) {
+            @Suppress("DEPRECATION")
+            power.newWakeLock(
+                PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                "iMirror:incoming"
+            ).acquire(WAKE_ON_CONNECT_MS)
+        }
+        try {
+            startActivity(
+                Intent(this, MainActivity::class.java).addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP
+                )
+            )
+        } catch (e: Exception) {
+            Logger.w("bringUiToFront: could not start MainActivity: ${e.message}")
+        }
     }
 
     /**
@@ -251,6 +279,7 @@ class MirrorService : Service() {
                     mimeType = imageType.mimeType
                 )
                 updateNotification(isRunning = true)
+                bringUiToFront()
             },
             onPhotoCleared = {
                 _photoFrame.value = null
@@ -260,6 +289,7 @@ class MirrorService : Service() {
             },
             onPinChanged = { pin ->
                 _pairingPin.value = pin
+                if (pin != null) bringUiToFront()
             },
             onStateChanged = { state ->
                 _airPlayState.value = state
@@ -269,6 +299,7 @@ class MirrorService : Service() {
                         _activeConnection.value =
                             ActiveConnection(pendingSenderName, Protocol.AIRPLAY)
                         updateNotification(isRunning = true, streamingSenderName = pendingSenderName)
+                        bringUiToFront()
                     }
                     ProtocolState.ADVERTISING,
                     ProtocolState.DISABLED,
@@ -386,6 +417,9 @@ class MirrorService : Service() {
         const val ACTION_START    = "dev.imirror.receiver.action.START"
         const val ACTION_STOP     = "dev.imirror.receiver.action.STOP"
         const val ACTION_RESTART  = "dev.imirror.receiver.action.RESTART"
+
+        /** How long the wake lock keeps the screen on while MainActivity opens and takes over. */
+        private const val WAKE_ON_CONNECT_MS = 10_000L
     }
 }
 
