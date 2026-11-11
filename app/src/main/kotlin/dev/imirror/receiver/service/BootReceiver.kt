@@ -14,7 +14,8 @@ import timber.log.Timber
  * BootReceiver — starts [MirrorService] on device boot if "Start on boot" is enabled.
  *
  * WHY: Android kills all services on reboot. For a receiver app to work without
- * the user manually reopening the app, we register for BOOT_COMPLETED.
+ * the user manually reopening the app, we register for BOOT_COMPLETED (and MY_PACKAGE_REPLACED,
+ * since installing an update kills the process).
  * The setting is checked asynchronously before starting the service to avoid
  * unnecessary foreground service starts that would show an unexpected notification.
  *
@@ -34,7 +35,7 @@ import timber.log.Timber
 class BootReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
+        if (intent.action != Intent.ACTION_BOOT_COMPLETED && intent.action != Intent.ACTION_MY_PACKAGE_REPLACED) return
 
         Timber.d("BootReceiver: BOOT_COMPLETED received")
 

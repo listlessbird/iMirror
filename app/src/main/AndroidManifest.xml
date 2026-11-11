@@ -124,8 +124,8 @@
             android:exported="false" />
 
         <!--
-            BootReceiver — listens for BOOT_COMPLETED and starts MirrorService
-            if the "Start on boot" setting is enabled.
+            BootReceiver — listens for BOOT_COMPLETED and MY_PACKAGE_REPLACED (an update kills the
+            process) and starts MirrorService if the "Start on boot" setting is enabled.
             exported="false" because it is only triggered by the system broadcast.
         -->
         <receiver
@@ -133,6 +133,7 @@
             android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
 
