@@ -10,10 +10,12 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import android.os.SystemClock
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
@@ -42,6 +44,8 @@ class SendService : Service() {
     private var job: Job? = null
     private var server: MediaServer? = null
     private var tv: TvEndpoint? = null
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
     @Volatile private var lastActivityAt = SystemClock.elapsedRealtime()
 
@@ -105,6 +109,7 @@ class SendService : Service() {
         )
         media.start()
         server = media
+        holdAwake()
 
         TvClient.play(endpoint, "http://${phone.hostAddress}:${media.port}/$token")
         startForeground("Playing on TV", withStop = true)
@@ -134,6 +139,19 @@ class SendService : Service() {
     private fun closeServer() {
         server?.close()
         server = null
+        wakeLock?.takeIf { it.isHeld }?.release()
+        wifiLock?.takeIf { it.isHeld }?.release()
+        wakeLock = null
+        wifiLock = null
+    }
+
+    /** The TV pulls video from us; with the screen off the CPU and Wi-Fi would otherwise doze mid-stream. */
+    @Suppress("DEPRECATION", "WakelockTimeout") // WIFI_MODE_FULL_HIGH_PERF is deprecated but still the lock that prevents Wi-Fi power save.
+    private fun holdAwake() {
+        wakeLock = getSystemService(PowerManager::class.java)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ShareToTv:serve").apply { acquire() } // released in closeServer(), which every exit path reaches
+        wifiLock = getSystemService(WifiManager::class.java)
+            .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "ShareToTv:serve").apply { acquire() }
     }
 
     private fun fail(message: String) {
