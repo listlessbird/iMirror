@@ -170,6 +170,11 @@ class MirrorService : Service() {
         videoSurfaceProvider = provider
     }
 
+    /** The Activity's Surface appeared, possibly after URL video started (TV was asleep); hand it over. */
+    fun onVideoSurfaceCreated() {
+        airPlayReceiver?.attachVideoSurface()
+    }
+
     /**
      * Sends a DACP transport command (TV remote → AirPlay sender), e.g. play/pause or skip what the
      * Mac/iPhone is streaming. Bound Activities call this from media-key events. No-op if no AirPlay

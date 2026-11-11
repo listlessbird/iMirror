@@ -50,6 +50,9 @@ class StreamingScreen @JvmOverloads constructor(
     // The Surface is created asynchronously by SurfaceView — stored here when ready
     private var surface: Surface? = null
 
+    /** Called on the main thread each time a new Surface is created. */
+    var onSurfaceCreated: () -> Unit = {}
+
     // Optional debug HUD (Settings → "Debug overlay"), drawn on top of the video.
     private val debugView = TextView(context).apply {
         setTextColor(Color.parseColor("#FF00FF66"))
@@ -103,6 +106,7 @@ class StreamingScreen @JvmOverloads constructor(
                 // Surface is now ready — store reference for VideoDecoder
                 surface = holder.surface
                 Logger.d("StreamingScreen: Surface created")
+                onSurfaceCreated()
             }
 
             override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {

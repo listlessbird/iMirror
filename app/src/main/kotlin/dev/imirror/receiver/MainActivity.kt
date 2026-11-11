@@ -172,6 +172,7 @@ class MainActivity : AppCompatActivity() {
      */
     private fun setupOverlayScreens() {
         streamingScreen = StreamingScreen(this)
+        streamingScreen.onSurfaceCreated = { service?.onVideoSurfaceCreated() }
         photoScreen = PhotoScreen(this)
         nowPlayingScreen = NowPlayingScreen(this)
         pinScreen = PinScreen(this)

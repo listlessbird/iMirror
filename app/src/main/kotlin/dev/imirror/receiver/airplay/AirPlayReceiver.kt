@@ -190,6 +190,11 @@ class AirPlayReceiver(
      */
     fun sendRemoteCommand(command: String) = dacpClient.sendCommand(command)
 
+    /** Gives a URL video that started before the UI existed its Surface. */
+    fun attachVideoSurface() {
+        urlVideoPlayer?.attachSurface()
+    }
+
     /** True once a sender has advertised DACP reverse-control (so the TV remote can drive playback). */
     fun isRemoteControlAvailable(): Boolean = dacpClient.isAvailable
 
