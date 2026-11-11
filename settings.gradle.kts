@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "iMirror"
 include(":app")
+include(":sender")
