@@ -4,15 +4,9 @@ import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 
-/** The three AirPlay HTTP calls the iMirror receiver needs. Blocking; call off the main thread. */
+/** One-shot AirPlay photo upload; video goes through [TvSession]. Blocking; call off the main thread. */
 object TvClient {
     fun putPhoto(tv: TvEndpoint, jpeg: ByteArray) = send(tv, "PUT", "/photo", "image/jpeg", jpeg)
-
-    /** Asks the TV to play [mediaUrl]; the receiver reads this legacy text body. */
-    fun play(tv: TvEndpoint, mediaUrl: String) =
-        send(tv, "POST", "/play", "text/parameters", "Content-Location: $mediaUrl\r\nStart-Position: 0\r\n".toByteArray())
-
-    fun stop(tv: TvEndpoint) = send(tv, "POST", "/stop", "text/parameters", ByteArray(0))
 
     private fun send(tv: TvEndpoint, method: String, path: String, contentType: String, body: ByteArray) {
         val conn = URL("http://${tv.host}:${tv.port}$path").openConnection() as HttpURLConnection

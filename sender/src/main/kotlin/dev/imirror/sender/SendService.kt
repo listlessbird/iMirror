@@ -32,22 +32,21 @@ import java.security.SecureRandom
 private const val CHANNEL_ID = "share_to_tv"
 private const val NOTIFICATION_ID = 1
 private const val ACTION_STOP = "dev.imirror.sender.STOP"
-private const val IDLE_LIMIT_MS = 10 * 60 * 1000L
+private const val POLL_MS = 2_000L
+private const val PREPARE_LIMIT_MS = 60_000L
 
 /**
  * Foreground service so the work outlives the invisible share activity. A photo is one upload.
- * A video runs a [MediaServer] on the phone and tells the TV to pull from it until stopped or idle.
+ * A video runs a [MediaServer] on the phone and holds a [TvSession] open until the TV finishes or Stop.
  */
 class SendService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val main = Handler(Looper.getMainLooper())
     private var job: Job? = null
     private var server: MediaServer? = null
-    private var tv: TvEndpoint? = null
+    @Volatile private var session: TvSession? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
-
-    @Volatile private var lastActivityAt = SystemClock.elapsedRealtime()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -93,29 +92,35 @@ class SendService : Service() {
 
     private suspend fun playVideo(item: Shareable.Video) {
         val endpoint = findTv(this) ?: return fail("TV not found")
-        tv = endpoint
         val length = contentResolver.openFileDescriptor(item.uri, "r")?.use { it.statSize }
             ?.takeIf { it >= 0 } ?: return fail("Can't read this video")
         val phone = phoneAddressFacing(endpoint) ?: return fail("Not on the TV's Wi-Fi")
 
         val token = ByteArray(16).also(SecureRandom()::nextBytes).joinToString("") { "%02x".format(it) }
-        lastActivityAt = SystemClock.elapsedRealtime()
         val media = MediaServer(
             token = token,
             mime = item.mime,
             length = length,
             openChannel = { openChannel(item.uri) },
-            onActivity = { lastActivityAt = SystemClock.elapsedRealtime() },
         )
         media.start()
         server = media
         holdAwake()
 
-        TvClient.play(endpoint, "http://${phone.hostAddress}:${media.port}/$token")
+        val tv = TvSession.play(endpoint, "http://${phone.hostAddress}:${media.port}/$token")
+        session = tv
         startForeground("Playing on TV", withStop = true)
 
-        // delay() throws if a newer share cancels this job, so only an idle timeout reaches stopPlayback().
-        while (SystemClock.elapsedRealtime() - lastActivityAt < IDLE_LIMIT_MS) delay(30_000)
+        // The TV reports not-ready while preparing and again once the video has ended.
+        val startedAt = SystemClock.elapsedRealtime()
+        var started = false
+        while (true) {
+            delay(POLL_MS) // throws if a newer share cancels this job
+            val info = tv.playbackInfo() // throws when the TV drops the session
+            if (info.readyToPlay) started = true
+            else if (started) break
+            else if (SystemClock.elapsedRealtime() - startedAt > PREPARE_LIMIT_MS) return fail("TV couldn't play this video")
+        }
         stopPlayback()
     }
 
@@ -128,15 +133,18 @@ class SendService : Service() {
     /** Stops the TV and tears down; runs on [scope] so it survives cancelling the playback job. */
     private fun stopPlayback() {
         job?.cancel()
-        val endpoint = tv
+        val tv = session
+        session = null // stopped below, after closeServer() would otherwise just drop it
         closeServer()
         scope.launch {
-            if (endpoint != null) runCatching { TvClient.stop(endpoint) }
+            tv?.stop()
             stopSelf()
         }
     }
 
     private fun closeServer() {
+        session?.close()
+        session = null
         server?.close()
         server = null
         wakeLock?.takeIf { it.isHeld }?.release()

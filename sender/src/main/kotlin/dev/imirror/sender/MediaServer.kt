@@ -16,14 +16,12 @@ import java.util.concurrent.Executors
  * needs Range support (it seeks to the moov atom) and opens several connections at once.
  *
  * [openChannel] is called per GET and the channel is closed after the response.
- * [onActivity] fires per request and per chunk written, so callers can tell a stalled server from a long stream.
  */
 class MediaServer(
     private val token: String,
     private val mime: String,
     private val length: Long,
     private val openChannel: () -> FileChannel,
-    private val onActivity: () -> Unit = {},
 ) : Closeable {
     private val serverSocket = ServerSocket(0)
     private val pool = Executors.newCachedThreadPool { r -> Thread(r, "media-server").apply { isDaemon = true } }
@@ -53,7 +51,6 @@ class MediaServer(
         try {
             while (true) {
                 val request = readRequest(input) ?: return
-                onActivity()
                 if (!respond(request, output)) return
             }
         } catch (_: IOException) {
@@ -137,7 +134,6 @@ class MediaServer(
                 if (n < 0) return false
                 out.write(buffer.array(), 0, n)
                 remaining -= n
-                onActivity()
             }
         }
         return true
