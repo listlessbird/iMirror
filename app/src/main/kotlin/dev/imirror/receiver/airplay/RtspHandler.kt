@@ -97,40 +97,38 @@ open class RtspHandler(
 
     private var currentCSeq: Int = 0
 
-    @Volatile
-    private var currentSession: SessionDescription? = null
-
-    /** Per-connection AirPlay pairing state (pair-setup / pair-verify). */
-    @Volatile
-    private var pairingSession: PairingSession? = null
-
-    /** Per-connection FairPlay state (fp-setup handshake + stream-key decrypt). */
-    @Volatile
-    private var fairPlay: FairPlay? = null
-
-    /** Remote (sender) address of the active control connection — needed for AirPlay 2 NTP. */
-    @Volatile
-    private var currentRemoteAddress: java.net.InetAddress? = null
-
-    /** True once an AirPlay 2 mirroring SETUP has run on this connection (no ANNOUNCE/SDP). */
-    @Volatile
-    private var isMirrorSession = false
-
-    /** Mirror stream types currently active (96 = audio, 110 = video). Drives TEARDOWN routing.
-     *  `protected` so tests can seed it without driving the full FairPlay SETUP handshake. */
-    protected val activeStreamTypes = mutableSetOf<Int>()
-
-    private var setupCount = 0
-
-    /** True once this connection sent POST /play; with the SDP/mirror state, marks it as a session. */
-    @Volatile
-    private var playedUrl = false
-
     /**
-     * Whether this connection started something that its close should end. Probes (GET /server-info,
-     * a photo PUT, a failed pairing) don't; tearing down for them killed the session that came next.
+     * Everything that lives exactly as long as one sender connection. A fresh one per connection
+     * means nothing to reset field by field. Connections are served one at a time (see runServer).
      */
-    private val startedSession get() = currentSession != null || isMirrorSession || playedUrl
+    private class Connection(
+        /** AirPlay pairing (pair-setup / pair-verify) and FairPlay (fp-setup + stream-key decrypt). */
+        val pairingSession: PairingSession? = null,
+        val fairPlay: FairPlay? = null,
+        /** The sender's address, needed for AirPlay 2 NTP. */
+        val currentRemoteAddress: java.net.InetAddress? = null,
+    ) {
+        /** Legacy RAOP session from ANNOUNCE. */
+        @Volatile var currentSession: SessionDescription? = null
+        /** An AirPlay 2 mirroring SETUP ran (no ANNOUNCE/SDP). */
+        @Volatile var isMirrorSession = false
+        /** Mirror stream types active (96 audio, 110 video, 103 buffered audio). Drives TEARDOWN routing. */
+        val activeStreamTypes = mutableSetOf<Int>()
+        var setupCount = 0
+        @Volatile var playedUrl = false
+
+        /**
+         * Whether closing this connection should end a session. Probes (GET /server-info, a photo
+         * PUT, a failed pairing) don't; tearing down for them killed the session that came next.
+         */
+        val startedSession get() = currentSession != null || isMirrorSession || playedUrl
+    }
+
+    @Volatile private var conn = Connection()
+
+    /** `protected` so tests can seed streams without driving the full FairPlay SETUP handshake. */
+    protected val activeStreamTypes get() = conn.activeStreamTypes
+
 
     private val requestReader = RtspRequestReader(
         maxMessageBytes = MAX_MESSAGE_BYTES,
@@ -218,13 +216,15 @@ open class RtspHandler(
         val outputStream = socket.getOutputStream()
 
         // Fresh pairing + FairPlay state for each control connection.
-        pairingSession = PairingSession(PairingKeys.get(context))
-        fairPlay = FairPlay()
+        conn = Connection(
+            pairingSession = PairingSession(PairingKeys.get(context)),
+            fairPlay = FairPlay(),
+            currentRemoteAddress = socket.inetAddress,
+        )
         // NOTE: legacyPin and pinPaired are deliberately NOT reset here. macOS runs the PIN handshake
         // across SEPARATE TCP connections (/pair-pin-start on one, /pair-setup-pin on the next), so the
         // PIN/verifier and the "paired" flag must survive a reconnect. They live for the receiver's
         // lifetime — replaced by the next /pair-pin-start, set on a successful pairing.
-        currentRemoteAddress = socket.inetAddress
 
         try {
             while (running && !socket.isClosed) {
@@ -238,14 +238,14 @@ open class RtspHandler(
                 // Music) keeps the RTSP control loop — audio arrives on the UDP port, and macOS sends
                 // now-playing metadata / volume / FLUSH / TEARDOWN as RTSP requests here that we must
                 // keep handling (switching to interleaved mode would skip them → no metadata).
-                if (request.method == "RECORD" && response.statusCode == 200 && !isMirrorSession &&
-                    currentSession?.hasVideo == true) {
+                if (request.method == "RECORD" && response.statusCode == 200 && !conn.isMirrorSession &&
+                    conn.currentSession?.hasVideo == true) {
                     Logger.d("RTSP handshake complete — switching to interleaved RTP (video)")
                     break
                 }
             }
 
-            val session = currentSession
+            val session = conn.currentSession
             if (session != null && session.hasVideo && running) {
                 RtpInterleaved.readLoop(
                     inputStream = inputStream,
@@ -262,15 +262,9 @@ open class RtspHandler(
         } finally {
             Logger.i("Client disconnected")
             socket.close()
-            val endsSession = startedSession
+            val endsSession = conn.startedSession
             activeClient = null
-            currentSession = null
-            pairingSession = null
-            fairPlay = null
-            isMirrorSession = false
-            activeStreamTypes.clear()
-            setupCount = 0
-            playedUrl = false
+            conn = Connection()
             if (endsSession) onStreamingStopped()
         }
     }
@@ -341,7 +335,7 @@ open class RtspHandler(
             return RtspResponse(400, "Bad Request", protocol = request.responseProtocol())
         }
         Logger.i("POST /play url=$url start=$start")
-        playedUrl = true
+        conn.playedUrl = true
         onVideoPlay(url, start)
         return RtspResponse(200, "OK", protocol = request.responseProtocol())
     }
@@ -495,7 +489,7 @@ open class RtspHandler(
     private fun handlePairSetup(request: RtspRequest): RtspResponse {
         // /pair-setup is the anonymous key exchange; PIN access control runs on /pair-setup-pin.
         return try {
-            val body = pairingSession!!.pairSetup(request.bodyBytes)
+            val body = conn.pairingSession!!.pairSetup(request.bodyBytes)
             Logger.i("pair-setup OK (returned ${body.size}-byte public key)")
             RtspResponse(200, "OK", bodyBytes = body, contentType = OCTET_STREAM, protocol = request.responseProtocol())
         } catch (e: Exception) {
@@ -517,7 +511,7 @@ open class RtspHandler(
             return RtspResponse(470, "Connection Authorization Required", protocol = request.responseProtocol())
         }
         return try {
-            val body = pairingSession!!.pairVerify(request.bodyBytes)
+            val body = conn.pairingSession!!.pairVerify(request.bodyBytes)
             Logger.i("pair-verify ${if (request.bodyBytes.firstOrNull()?.toInt() == 1) "M1" else "M2"} OK (returned ${body.size} bytes)")
             RtspResponse(200, "OK", bodyBytes = body, contentType = OCTET_STREAM, protocol = request.responseProtocol())
         } catch (e: Exception) {
@@ -592,7 +586,7 @@ open class RtspHandler(
 
     /** POST /fp-setup — FairPlay: 16-byte phase 1 → 142-byte reply; 164-byte phase 2 → 32-byte reply. */
     private fun handleFpSetup(request: RtspRequest): RtspResponse = try {
-        val fp = fairPlay!!
+        val fp = conn.fairPlay!!
         val b = request.bodyBytes
         // Diagnostics: byte 4 is the FairPlay version (0x03 mirroring/Safari, 0x02 Apple Music audio);
         // for phase 1, byte 14 is the mode (0..3). Confirms which path a given sender uses.
@@ -627,14 +621,14 @@ open class RtspHandler(
         })
         val response = mutableMapOf<String, Any?>()
 
-        isMirrorSession = true
+        conn.isMirrorSession = true
         val ekey = req["ekey"] as? ByteArray
         if (ekey != null) {
-            val aesKey = fairPlay!!.decrypt(ekey)
-            val ecdhSecret = pairingSession?.sharedSecret ?: error("mirror SETUP before pair-verify")
+            val aesKey = conn.fairPlay!!.decrypt(ekey)
+            val ecdhSecret = conn.pairingSession?.sharedSecret ?: error("mirror SETUP before pair-verify")
             val aesIv = (req["eiv"] as? ByteArray) ?: ByteArray(16)
             val senderTimingPort = (req["timingPort"] as? Long)?.toInt() ?: 0
-            val remoteAddr = currentRemoteAddress ?: error("mirror SETUP without remote address")
+            val remoteAddr = conn.currentRemoteAddress ?: error("mirror SETUP without remote address")
             val (eventPort, timingPort) = onMirrorSetupKeys(aesKey, ecdhSecret, aesIv, remoteAddr, senderTimingPort)
             response["eventPort"] = eventPort.toLong()
             response["timingPort"] = timingPort.toLong()
@@ -649,7 +643,7 @@ open class RtspHandler(
                     110 -> {
                         val scid = (stream["streamConnectionID"] as? Long) ?: 0L
                         val dataPort = onMirrorStreamStart(scid)
-                        activeStreamTypes.add(110)
+                        conn.activeStreamTypes.add(110)
                         Logger.i("mirror stream type=110 streamConnectionID=$scid dataPort=$dataPort")
                         mapOf("type" to 110L, "dataPort" to dataPort.toLong())
                     }
@@ -667,7 +661,7 @@ open class RtspHandler(
                         val ct = (stream["ct"] as? Long)?.toInt() ?: 8   // 8 = AAC-ELD (mirror), 4 = AAC-LC, 2 = ALAC
                         val spf = (stream["spf"] as? Long)?.toInt() ?: 352   // ALAC frameLength (samples/frame)
                         val (dataPort, controlPort) = onMirrorAudioStart(sr, ch, ct, spf)
-                        activeStreamTypes.add(96)
+                        conn.activeStreamTypes.add(96)
                         Logger.i("audio stream type=96 (ct=$ct ${sr}Hz x$ch spf=$spf) dataPort=$dataPort controlPort=$controlPort")
                         mapOf("type" to 96L, "dataPort" to dataPort.toLong(), "controlPort" to controlPort.toLong())
                     }
@@ -683,7 +677,7 @@ open class RtspHandler(
                             return@mapNotNull null
                         }
                         val dataPort = onBufferedAudioStart()
-                        activeStreamTypes.add(103)
+                        conn.activeStreamTypes.add(103)
                         Logger.i("buffered audio stream type=103 dataPort=$dataPort")
                         mapOf("type" to 103L, "dataPort" to dataPort.toLong())
                     }
@@ -730,12 +724,12 @@ open class RtspHandler(
             return RtspResponse(statusCode = 400, statusMessage = "Bad Request")
         }
 
-        currentSession = parsed.copy(senderName = extractSenderName(request.headers["User-Agent"]))
-        val s = currentSession!!
+        conn.currentSession = parsed.copy(senderName = extractSenderName(request.headers["User-Agent"]))
+        val s = conn.currentSession!!
         Logger.i("Session: hasVideo=${s.hasVideo} hasAudio=${s.hasAudio} " +
                  "codec=${s.audioCodec} encrypted=${s.isAudioEncrypted} sender='${s.senderName}'")
 
-        setupCount = 0
+        conn.setupCount = 0
         return RtspResponse(statusCode = 200, statusMessage = "OK")
     }
 
@@ -747,10 +741,10 @@ open class RtspHandler(
 
     /** Handles SETUP — allocates a media channel. */
     open fun handleSetupInternal(request: RtspRequest): RtspResponse {
-        setupCount++
-        val session = currentSession
+        conn.setupCount++
+        val session = conn.currentSession
 
-        val isVideoSetup = setupCount == 1 && session?.hasVideo == true
+        val isVideoSetup = conn.setupCount == 1 && session?.hasVideo == true
 
         val transport = if (isVideoSetup) {
             "RTP/AVP/TCP;unicast;interleaved=0-1"
@@ -761,7 +755,7 @@ open class RtspHandler(
             "timing-port=${TimingHandler.TIMING_PORT}"
         }
 
-        Logger.d("SETUP #$setupCount — transport: $transport")
+        Logger.d("SETUP #${conn.setupCount} — transport: $transport")
         return RtspResponse(
             statusCode = 200,
             statusMessage = "OK",
@@ -772,7 +766,7 @@ open class RtspHandler(
     /** Handles RECORD — macOS/iOS says start sending media now. */
     open fun handleRecordInternal(request: RtspRequest): RtspResponse {
         // AirPlay 2 mirroring has no ANNOUNCE/SDP — RECORD just acknowledges the session.
-        if (isMirrorSession) {
+        if (conn.isMirrorSession) {
             Logger.i("RECORD (mirror session) — OK")
             return RtspResponse(
                 statusCode = 200, statusMessage = "OK",
@@ -780,7 +774,7 @@ open class RtspHandler(
                 protocol = request.responseProtocol()
             )
         }
-        var session = currentSession
+        var session = conn.currentSession
         if (session == null) {
             Logger.e("RECORD received but no session from ANNOUNCE — rejecting")
             return RtspResponse(statusCode = 455, statusMessage = "Method Not Valid in This State")
@@ -789,14 +783,14 @@ open class RtspHandler(
         // fp-setup session into the real 16-byte key so the AudioPlayer can AES-CBC-decrypt the stream.
         val fpKey = session.fpAesKey
         if (fpKey != null && session.aesKey == null) {
-            val realKey = runCatching { fairPlay?.decrypt(fpKey) }
+            val realKey = runCatching { conn.fairPlay?.decrypt(fpKey) }
                 .onFailure { Logger.w("RAOP FairPlay audio-key decrypt failed (${fpKey.size}B): ${it.message}") }
                 .getOrNull()
             if (realKey != null) {
                 Logger.i("RAOP FairPlay (v0x%02x) audio key decrypted → ${realKey.size}B AES key, iv=${session.aesIv?.size ?: 0}B"
-                    .format(fairPlay?.negotiatedVersion ?: 0))
+                    .format(conn.fairPlay?.negotiatedVersion ?: 0))
                 session = session.copy(aesKey = realKey)
-                currentSession = session
+                conn.currentSession = session
             }
         }
         Logger.i("RECORD — streaming starting (audioOnly=${session.isAudioOnly}, encrypted=${session.isAudioEncrypted})")
@@ -820,18 +814,18 @@ open class RtspHandler(
             // with audio stopped. But if this removes the LAST active stream (e.g. macOS names both
             // 96 and 110 to end the session), fall through to a full teardown so cleanup isn't left
             // to the eventual socket close.
-            if (streamTypes.contains(96)) { onMirrorAudioStop(); activeStreamTypes.remove(96) }
-            if (streamTypes.contains(110)) { onMirrorVideoStop(); activeStreamTypes.remove(110) }
-            if (streamTypes.contains(103)) { onBufferedAudioStop(); activeStreamTypes.remove(103) }
-            if (activeStreamTypes.isNotEmpty()) {
-                Logger.i("TEARDOWN streams=$streamTypes — stopped those, session continues (active=$activeStreamTypes)")
+            if (streamTypes.contains(96)) { onMirrorAudioStop(); conn.activeStreamTypes.remove(96) }
+            if (streamTypes.contains(110)) { onMirrorVideoStop(); conn.activeStreamTypes.remove(110) }
+            if (streamTypes.contains(103)) { onBufferedAudioStop(); conn.activeStreamTypes.remove(103) }
+            if (conn.activeStreamTypes.isNotEmpty()) {
+                Logger.i("TEARDOWN streams=$streamTypes — stopped those, session continues (active=${conn.activeStreamTypes})")
                 return RtspResponse(statusCode = 200, statusMessage = "OK", protocol = request.responseProtocol())
             }
             Logger.i("TEARDOWN streams=$streamTypes — last stream removed, ending session")
         } else {
             Logger.i("TEARDOWN (session, body=${request.bodyBytes.size}B) — streaming stopping")
         }
-        activeStreamTypes.clear()
+        conn.activeStreamTypes.clear()
         onStreamingStopped()
         return RtspResponse(statusCode = 200, statusMessage = "OK", protocol = request.responseProtocol())
     }
