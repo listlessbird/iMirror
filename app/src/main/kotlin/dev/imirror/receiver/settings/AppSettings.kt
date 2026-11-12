@@ -24,10 +24,9 @@ data class AppSettings(
     // ─── Display ───────────────────────────────────────────────────────────
     /**
      * The name shown in sender pickers (AirPlay menu on Mac, Cast picker in Chrome, etc.).
-     * If empty, the Android device name is used as a fallback.
-     * Validated: max 63 characters, must not be blank after trimming.
+     * Empty (the default) means the Android device name is used. Max 63 characters.
      */
-    val displayName: String = "Pratik AirPlay",
+    val displayName: String = "",
 
     // ─── Protocols ─────────────────────────────────────────────────────────
     /**
