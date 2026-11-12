@@ -394,8 +394,18 @@ class MainActivity : AppCompatActivity() {
             nowPlaying != null -> showNowPlayingScreen(nowPlaying)
             currentAirPlayState == ProtocolState.CONNECTED -> showStreamingScreen()
             photoFrame != null -> showPhotoScreen(photoFrame)
-            else -> hideStreamingScreen()
+            else -> endSessionOverlay()
         }
+    }
+
+    /**
+     * Hides the overlay; if one was up (a session just ended), steps aside so the TV returns to
+     * whatever was on before instead of parking on iMirror's home screen.
+     */
+    private fun endSessionOverlay() {
+        val wasShowing = streamingContainer.visibility == View.VISIBLE
+        hideStreamingScreen()
+        if (wasShowing) moveTaskToBack(true)
     }
 
     /** Shows the AirPlay pairing PIN over the full screen during SRP pair-setup. */

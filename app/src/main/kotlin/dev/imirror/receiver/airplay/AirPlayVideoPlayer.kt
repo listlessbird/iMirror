@@ -50,6 +50,11 @@ class AirPlayVideoPlayer(
             )
             surfaceProvider()?.let { player.setSurface(it) }
             player.setOnPreparedListener { onPrepared(it) }
+            // StreamingScreen letterboxes from StreamStats; without this a portrait video is stretched.
+            player.setOnVideoSizeChangedListener { _, w, h ->
+                StreamStats.videoWidth = w
+                StreamStats.videoHeight = h
+            }
             player.setOnCompletionListener { Logger.i("AirPlay video: completed"); onEnded() }
             player.setOnErrorListener { _, what, extra ->
                 Logger.e("AirPlay video error what=$what extra=$extra")

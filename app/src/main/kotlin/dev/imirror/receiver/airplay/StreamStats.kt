@@ -21,7 +21,7 @@ object StreamStats {
     @Volatile var videoQueue = 0       // current decode-queue depth
     @Volatile var videoDropPct = 0     // cumulative % of frames dropped under load
 
-    // Actual decoded video dimensions (from the SPS, so portrait phone streams are portrait here).
+    // Actual video dimensions (mirroring: from the SPS; URL video: from MediaPlayer), so portrait is portrait.
     // StreamingScreen reads these to aspect-fit the Surface instead of stretching to 16:9.
     @Volatile var videoWidth = 0
     @Volatile var videoHeight = 0
