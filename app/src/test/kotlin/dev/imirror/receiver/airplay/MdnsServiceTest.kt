@@ -42,6 +42,12 @@ class MdnsServiceTest {
         // Tell the mock context to return our mock NsdManager
         every { mockContext.getSystemService(Context.NSD_SERVICE) } returns mockNsdManager
 
+        // Like the real NsdManager, report each registration as done. MdnsService registers
+        // _raop first and only chains _airplay from that callback (two in flight cancel each other).
+        every { mockNsdManager.registerService(any(), any(), any()) } answers {
+            thirdArg<NsdManager.RegistrationListener>().onServiceRegistered(mockk(relaxed = true))
+        }
+
         mdnsService = MdnsService(mockContext)
     }
 
