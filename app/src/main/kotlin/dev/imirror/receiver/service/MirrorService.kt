@@ -31,6 +31,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * MirrorService — Android ForegroundService that hosts all receiver protocols.
@@ -106,10 +108,10 @@ class MirrorService : Service() {
         startForeground(NOTIFICATION_ID, buildNotification(isRunning = false))
 
         when (intent?.action) {
-            ACTION_START   -> serviceScope.launch { startReceivers() }
-            ACTION_STOP    -> serviceScope.launch { stopReceivers(); stopSelf() }
-            ACTION_RESTART -> serviceScope.launch { restartReceivers() }
-            else           -> serviceScope.launch { startReceivers() } // default: start
+            ACTION_START   -> lifecycleCommand { startReceivers() }
+            ACTION_STOP    -> lifecycleCommand { stopReceivers(); stopSelf() }
+            ACTION_RESTART -> lifecycleCommand { restartReceivers() }
+            else           -> lifecycleCommand { startReceivers() } // default: start
         }
 
         // START_STICKY: if the system kills the service, restart it with a null intent
@@ -125,8 +127,18 @@ class MirrorService : Service() {
      */
     override fun onTaskRemoved(rootIntent: Intent?) {
         Logger.i("App task removed — restarting receivers, staying available")
-        serviceScope.launch { restartReceivers() }
+        lifecycleCommand { restartReceivers() }
         super.onTaskRemoved(rootIntent)
+    }
+
+    private val lifecycle = Mutex()
+
+    /**
+     * Start/stop/restart run one at a time. Concurrent, two restarts (task removed + activity
+     * destroyed) could both pass startAirPlay's null check and bind two receivers to port 7000.
+     */
+    private fun lifecycleCommand(block: suspend () -> Unit) {
+        serviceScope.launch { lifecycle.withLock { block() } }
     }
 
     /**
