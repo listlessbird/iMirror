@@ -9,173 +9,123 @@ import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.net.Uri
-import android.net.wifi.WifiManager
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.os.ParcelFileDescriptor
-import android.os.PowerManager
-import android.os.SystemClock
 import android.util.Log
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
-import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.MainScope
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import java.security.SecureRandom
+import kotlinx.coroutines.withContext
+import kotlin.concurrent.thread
 
 private const val TAG = "ShareToTv"
 private const val CHANNEL_ID = "share_to_tv"
 private const val NOTIFICATION_ID = 1
 private const val ACTION_STOP = "dev.imirror.sender.STOP"
-private const val POLL_MS = 2_000L
-private const val PREPARE_LIMIT_MS = 60_000L
+
+/** What we have on the TV. Only the main thread reads or writes it, and the notification follows it. */
+private sealed interface OnTv {
+    data object Nothing : OnTv
+    data object Sending : OnTv
+    data class Photo(val tv: TvEndpoint) : OnTv
+    class Video(val playback: VideoPlayback) : OnTv
+}
 
 /**
  * Foreground service so the work outlives the invisible share activity. A photo is one upload, then the
- * notification stays as its Close button. A video runs a [MediaServer] on the phone and holds a
- * [TvSession] open until the TV finishes or Stop. Dismissing the notification also stops either.
+ * notification stays as its Close button. A video holds a [VideoPlayback] until the TV finishes or Stop.
+ * A new share replaces whatever is on the TV.
  */
 class SendService : Service() {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val scope = MainScope()
     private val main = Handler(Looper.getMainLooper())
     private var job: Job? = null
-    private var server: MediaServer? = null
-    @Volatile private var session: TvSession? = null
-    @Volatile private var photoOn: TvEndpoint? = null
-    private var wakeLock: PowerManager.WakeLock? = null
-    private var wifiLock: WifiManager.WifiLock? = null
+    private var onTv: OnTv = OnTv.Nothing
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
-            stopPlayback()
+            stop()
             return START_NOT_STICKY
         }
         val item = Shareable.from(intent?.type, intent?.data)
         if (item == null) {
-            stopSelf()
+            if (onTv == OnTv.Nothing) stopSelf()
             return START_NOT_STICKY
         }
-        // A new share replaces whatever was running.
         job?.cancel()
-        photoOn = null
-        closeServer()
-        startForeground("Sending to TV", stopLabel = null)
+        enter(OnTv.Sending)
         job = scope.launch {
             try {
                 when (item) {
                     is Shareable.Photo -> sendPhoto(item)
                     is Shareable.Video -> playVideo(item)
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                if (!isActive) return@launch
                 Log.e(TAG, "send failed", e)
-                toast("TV: ${e.message ?: e.javaClass.simpleName}")
-                stopSelf()
+                toast(if (e is ShareError) e.message.orEmpty() else "TV: ${e.message ?: e.javaClass.simpleName}")
+                enter(OnTv.Nothing)
             }
         }
         return START_NOT_STICKY
     }
 
     override fun onDestroy() {
-        closeServer()
-        scope.coroutineContext[Job]?.cancel()
+        scope.cancel()
+        (onTv as? OnTv.Video)?.playback?.close()
     }
 
     private suspend fun sendPhoto(item: Shareable.Photo) {
-        val endpoint = findTv(this) ?: return fail("TV not found")
-        TvSession.putPhoto(endpoint, encodePhotoForTv(contentResolver, item.uri))
-        photoOn = endpoint
-        startForeground("Showing on TV", stopLabel = "Close")
+        val tv = findTv(this) ?: throw ShareError("TV not found")
+        withContext(Dispatchers.IO) { TvSession.putPhoto(tv, encodePhotoForTv(contentResolver, item.uri)) }
+        enter(OnTv.Photo(tv))
     }
 
     private suspend fun playVideo(item: Shareable.Video) {
-        val endpoint = findTv(this) ?: return fail("TV not found")
-        val length = contentResolver.openFileDescriptor(item.uri, "r")?.use { it.statSize }
-            ?.takeIf { it >= 0 } ?: return fail("Can't read this video")
-        val phone = phoneAddressFacing(endpoint) ?: return fail("Not on the TV's Wi-Fi")
-
-        val token = ByteArray(16).also(SecureRandom()::nextBytes).joinToString("") { "%02x".format(it) }
-        val media = MediaServer(
-            token = token,
-            mime = item.mime,
-            length = length,
-            openChannel = { openChannel(item.uri) },
-        )
-        media.start()
-        server = media
-        holdAwake()
-
-        val tv = TvSession.play(endpoint, "http://${phone.hostAddress}:${media.port}/$token")
-        session = tv
-        startForeground("Playing on TV", stopLabel = "Stop")
-
-        // The TV reports not-ready while preparing and again once the video has ended.
-        val startedAt = SystemClock.elapsedRealtime()
-        var started = false
-        while (true) {
-            delay(POLL_MS) // throws if a newer share cancels this job
-            val info = tv.playbackInfo() // throws when the TV drops the session
-            if (info.readyToPlay) started = true
-            else if (started) break
-            else if (SystemClock.elapsedRealtime() - startedAt > PREPARE_LIMIT_MS) return fail("TV couldn't play this video")
+        val tv = findTv(this) ?: throw ShareError("TV not found")
+        // Not cancellable, so a share replaced mid-start still gets its playback back to close.
+        val playback = withContext(NonCancellable + Dispatchers.IO) { VideoPlayback.start(this@SendService, tv, item) }
+        if (!currentCoroutineContext().isActive) {
+            playback.close()
+            return
         }
-        stopPlayback()
+        enter(OnTv.Video(playback))
+        playback.awaitEnd()
+        enter(OnTv.Nothing)
     }
 
-    /** AutoCloseInputStream closes the descriptor together with the channel. */
-    private fun openChannel(uri: Uri) =
-        ParcelFileDescriptor.AutoCloseInputStream(
-            checkNotNull(contentResolver.openFileDescriptor(uri, "r")) { "provider returned no file" },
-        ).channel
-
-    /** Takes the video or photo off the TV and tears down; runs on [scope] so it survives cancelling the job. */
-    private fun stopPlayback() {
+    /** Takes our video or photo off the TV and ends the service. */
+    private fun stop() {
         job?.cancel()
-        val tv = session
-        val photo = photoOn
-        session = null // stopped below, after closeServer() would otherwise just drop it
-        photoOn = null
-        closeServer()
-        scope.launch {
-            tv?.stop()
-            if (photo != null) runCatching { TvSession.clearPhoto(photo) }
-            stopSelf()
+        val photo = (onTv as? OnTv.Photo)?.tv
+        enter(OnTv.Nothing) // closing a video's connection already ends it on the TV
+        // The service is going away, so a plain thread rather than its scope.
+        if (photo != null) thread { runCatching { TvSession.clearPhoto(photo) } }
+    }
+
+    /** The only writer of [onTv]: releases the old state's resources and shows the new state's notification. */
+    private fun enter(next: OnTv) {
+        (onTv as? OnTv.Video)?.playback?.close()
+        onTv = next
+        when (next) {
+            OnTv.Nothing -> stopSelf()
+            OnTv.Sending -> startForeground("Sending to TV", stopLabel = null)
+            is OnTv.Photo -> startForeground("Showing on TV", stopLabel = "Close")
+            is OnTv.Video -> startForeground("Playing on TV", stopLabel = "Stop")
         }
-    }
-
-    private fun closeServer() {
-        session?.close()
-        session = null
-        server?.close()
-        server = null
-        wakeLock?.takeIf { it.isHeld }?.release()
-        wifiLock?.takeIf { it.isHeld }?.release()
-        wakeLock = null
-        wifiLock = null
-    }
-
-    /** The TV pulls video from us; with the screen off the CPU and Wi-Fi would otherwise doze mid-stream. */
-    @Suppress("DEPRECATION", "WakelockTimeout") // WIFI_MODE_FULL_HIGH_PERF is deprecated but still the lock that prevents Wi-Fi power save.
-    private fun holdAwake() {
-        wakeLock = getSystemService(PowerManager::class.java)
-            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ShareToTv:serve").apply { acquire() } // released in closeServer(), which every exit path reaches
-        wifiLock = getSystemService(WifiManager::class.java)
-            .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "ShareToTv:serve").apply { acquire() }
-    }
-
-    private fun fail(message: String) {
-        Log.w(TAG, message)
-        toast(message)
-        stopSelf()
     }
 
     private fun toast(message: String) = main.post { Toast.makeText(this, message, Toast.LENGTH_LONG).show() }

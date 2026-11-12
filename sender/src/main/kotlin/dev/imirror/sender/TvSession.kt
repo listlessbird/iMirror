@@ -20,12 +20,6 @@ class TvSession private constructor(private val socket: Socket) : Closeable {
     /** Polls the TV; IOException means the TV dropped the session. */
     fun playbackInfo(): PlaybackInfo = PlaybackInfo.parse(request("GET", "/playback-info"))
 
-    /** Best-effort POST /stop, then close (which also ends playback on the receiver). */
-    fun stop() {
-        runCatching { request("POST", "/stop") }
-        close()
-    }
-
     override fun close() {
         runCatching { socket.close() }
     }
