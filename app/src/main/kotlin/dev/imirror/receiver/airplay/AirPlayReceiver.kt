@@ -156,7 +156,7 @@ class AirPlayReceiver(
                 startRtspHandler()
             } catch (e: Exception) {
                 Logger.e("Failed to start AirPlayReceiver", e)
-                emitState(ProtocolState.ERROR)
+                setAdvertising(ProtocolState.ERROR)
             }
         }
     }
@@ -209,9 +209,7 @@ class AirPlayReceiver(
     private fun startMdnsService() {
         mdnsService = MdnsService(
             context = context,
-            // mDNS re-registration finishes a second or two after a connection closes. If a new
-            // session has started by then, its late ADVERTISING must not hide the session UI.
-            onStateChange = { state -> if (!(state == ProtocolState.ADVERTISING && connected)) emitState(state) },
+            onStateChange = { state -> setAdvertising(state) },
             onActualNameRegistered = { actualName -> onActualNameRegistered(actualName) }
         ).also { it.start(displayName.ifBlank { null }) }
         Logger.d("mDNS service started")
@@ -286,10 +284,10 @@ class AirPlayReceiver(
                 // Notify MirrorService of the sender name BEFORE emitting CONNECTED,
                 // so the name is ready when the ActiveConnection is created.
                 onSenderNameChanged(session.senderName)
-                emitState(ProtocolState.CONNECTED)
+                setInSession(true)
             } catch (e: Exception) {
                 Logger.e("Failed to start media pipeline", e)
-                emitState(ProtocolState.ERROR)
+                setInSession(false)
             }
         }
     }
@@ -303,7 +301,7 @@ class AirPlayReceiver(
     private fun onStreamingStopped() {
         Logger.i("Streaming stopped — releasing media components")
         releaseMediaComponents()
-        emitState(ProtocolState.ADVERTISING)
+        setInSession(false)
 
         scope.launch {
             try {
@@ -448,7 +446,7 @@ class AirPlayReceiver(
         // AirPlay 2 NTP is receiver-initiated: poll the sender's timing port so macOS proceeds.
         val ntp = AirPlayNtpClient(remoteAddress, senderTimingPort).also { ntpClient = it; it.start(scope) }
         onSenderNameChanged("AirPlay")
-        emitState(ProtocolState.CONNECTED)
+        setInSession(true)
         Logger.i("Mirror keys set; eventPort=${event.localPort} timingPort=${ntp.localPort}")
         return event.localPort to ntp.localPort
     }
@@ -504,7 +502,7 @@ class AirPlayReceiver(
      */
     private fun startUrlVideo(url: String, startFraction: Double) {
         onSenderNameChanged("AirPlay")
-        emitState(ProtocolState.CONNECTED)   // shows StreamingScreen → Surface becomes available
+        setInSession(true)   // shows StreamingScreen → Surface becomes available
         val player = urlVideoPlayer ?: AirPlayVideoPlayer(
             surfaceProvider = videoSurfaceProvider,
             onEnded = { stopUrlVideo() }
@@ -595,19 +593,22 @@ class AirPlayReceiver(
 
     // ─── Private: state emission ─────────────────────────────────────────────
 
-    /** True from CONNECTED until the next other state; set on the calling thread, before dispatch. */
-    @Volatile private var connected = false
+    // The published ProtocolState is derived from two independent inputs. mDNS re-registers after
+    // every session and reports DISABLED → ADVERTISING while doing so; that must never end a session
+    // that started in the meantime, so a session outranks whatever mDNS says.
+    private var advertising = ProtocolState.DISABLED   // DISABLED / ADVERTISING / ERROR, from mDNS
+    private var inSession = false
+    private val mainHandler = Handler(Looper.getMainLooper())
 
-    /**
-     * Dispatches [state] on the Main thread (Android UI rule). Handler.post keeps call order, so a
-     * session ending and the next one starting a moment later can't arrive swapped.
-     */
-    private fun emitState(state: ProtocolState) {
-        connected = state == ProtocolState.CONNECTED
+    @Synchronized private fun setAdvertising(state: ProtocolState) { advertising = state; publish() }
+
+    @Synchronized private fun setInSession(active: Boolean) { inSession = active; publish() }
+
+    /** Posts on the Main thread in call order (Handler.post is FIFO), so updates can't arrive swapped. */
+    private fun publish() {
+        val state = if (inSession) ProtocolState.CONNECTED else advertising
         mainHandler.post { if (scope.isActive) onStateChanged(state) }
     }
-
-    private val mainHandler = Handler(Looper.getMainLooper())
 
     companion object {
         // Hint dimensions for MediaCodec configuration.

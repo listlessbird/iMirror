@@ -122,6 +122,16 @@ open class RtspHandler(
 
     private var setupCount = 0
 
+    /** True once this connection sent POST /play; with the SDP/mirror state, marks it as a session. */
+    @Volatile
+    private var playedUrl = false
+
+    /**
+     * Whether this connection started something that its close should end. Probes (GET /server-info,
+     * a photo PUT, a failed pairing) don't; tearing down for them killed the session that came next.
+     */
+    private val startedSession get() = currentSession != null || isMirrorSession || playedUrl
+
     private val requestReader = RtspRequestReader(
         maxMessageBytes = MAX_MESSAGE_BYTES,
         maxPhotoBytes = PhotoHandler.MAX_PHOTO_BYTES
@@ -191,13 +201,6 @@ open class RtspHandler(
                 val clientSocket = serverSocket!!.accept()
                 Logger.i("New client connected: ${clientSocket.inetAddress.hostAddress}")
 
-                if (activeClient != null && !activeClient!!.isClosed) {
-                    Logger.w("Rejecting second client — already streaming")
-                    sendServiceUnavailable(clientSocket)
-                    clientSocket.close()
-                    continue
-                }
-
                 activeClient = clientSocket
                 handleClient(clientSocket)
             }
@@ -259,6 +262,7 @@ open class RtspHandler(
         } finally {
             Logger.i("Client disconnected")
             socket.close()
+            val endsSession = startedSession
             activeClient = null
             currentSession = null
             pairingSession = null
@@ -266,7 +270,8 @@ open class RtspHandler(
             isMirrorSession = false
             activeStreamTypes.clear()
             setupCount = 0
-            onStreamingStopped()
+            playedUrl = false
+            if (endsSession) onStreamingStopped()
         }
     }
 
@@ -336,6 +341,7 @@ open class RtspHandler(
             return RtspResponse(400, "Bad Request", protocol = request.responseProtocol())
         }
         Logger.i("POST /play url=$url start=$start")
+        playedUrl = true
         onVideoPlay(url, start)
         return RtspResponse(200, "OK", protocol = request.responseProtocol())
     }
@@ -971,16 +977,6 @@ open class RtspHandler(
             outputStream.write(wire)
         }
         outputStream.flush()
-    }
-
-    private fun sendServiceUnavailable(socket: Socket) {
-        try {
-            val response = "RTSP/1.0 503 Service Unavailable\r\nCSeq: 0\r\n\r\n"
-            socket.outputStream.write(response.toByteArray())
-            socket.outputStream.flush()
-        } catch (e: Exception) {
-            Logger.e("Error sending 503 response", e)
-        }
     }
 
     companion object {
