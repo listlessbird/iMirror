@@ -254,15 +254,16 @@ class MainActivity : AppCompatActivity() {
         streamingContainer.bringToFront()
     }
 
-    fun showPhotoScreen(photoFrame: PhotoFrame) {
-        if (photoScreen.showPhoto(photoFrame.bytes)) {
-            streamingScreen.visibility = View.GONE
-            nowPlayingScreen.visibility = View.GONE
-            pinScreen.visibility = View.GONE
-            photoScreen.visibility = View.VISIBLE
-            streamingContainer.visibility = View.VISIBLE
-            streamingContainer.bringToFront()
-        }
+    /** False when the photo can't be decoded (nothing shown). */
+    fun showPhotoScreen(photoFrame: PhotoFrame): Boolean {
+        if (!photoScreen.showPhoto(photoFrame.bytes)) return false
+        streamingScreen.visibility = View.GONE
+        nowPlayingScreen.visibility = View.GONE
+        pinScreen.visibility = View.GONE
+        photoScreen.visibility = View.VISIBLE
+        streamingContainer.visibility = View.VISIBLE
+        streamingContainer.bringToFront()
+        return true
     }
 
     /** Shows the audio-only now-playing card (AirPlay audio with no video). */
@@ -299,8 +300,7 @@ class MainActivity : AppCompatActivity() {
      * false for other keys so normal navigation is unaffected.
      */
     override fun onKeyDown(keyCode: Int, event: android.view.KeyEvent?): Boolean {
-        val overlayActive = currentNowPlaying != null || currentAirPlayState == ProtocolState.CONNECTED
-        if (overlayActive) {
+        if (overlay == Overlay.NowPlaying || overlay == Overlay.Video) {
             val command = when (keyCode) {
                 android.view.KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
                 android.view.KeyEvent.KEYCODE_MEDIA_PLAY,
@@ -382,30 +382,30 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** Which full-screen overlay is up; only [updateOverlay] changes it. */
+    private enum class Overlay { None, Pin, NowPlaying, Video, Photo }
+    private var overlay = Overlay.None
+
     private fun updateOverlay() {
         val photoFrame = currentPhotoFrame
         val nowPlaying = currentNowPlaying
         val pin = currentPin
-        when {
+        val next = when {
             // PIN pairing (access control) happens before streaming — show the code over everything.
-            pin != null -> showPinScreen(pin)
+            pin != null -> { showPinScreen(pin); Overlay.Pin }
             // Audio-only AirPlay (system audio, Music, podcasts): show the now-playing card instead
             // of the black video surface. Set whenever audio plays without video.
-            nowPlaying != null -> showNowPlayingScreen(nowPlaying)
-            currentAirPlayState == ProtocolState.CONNECTED -> showStreamingScreen()
-            photoFrame != null -> showPhotoScreen(photoFrame)
-            else -> endSessionOverlay()
+            nowPlaying != null -> { showNowPlayingScreen(nowPlaying); Overlay.NowPlaying }
+            currentAirPlayState == ProtocolState.CONNECTED -> { showStreamingScreen(); Overlay.Video }
+            photoFrame != null && showPhotoScreen(photoFrame) -> Overlay.Photo
+            else -> { hideStreamingScreen(); Overlay.None }
         }
-    }
-
-    /**
-     * Hides the overlay; if one was up (a session just ended), steps aside so the TV returns to
-     * whatever was on before instead of parking on iMirror's home screen.
-     */
-    private fun endSessionOverlay() {
-        val wasShowing = streamingContainer.visibility == View.VISIBLE
-        hideStreamingScreen()
-        if (wasShowing) moveTaskToBack(true)
+        // A session just ended: step aside so the TV returns to whatever was on before instead of
+        // parking on iMirror's home screen. Not after a PIN, which is followed by the session itself.
+        if (next == Overlay.None && overlay in setOf(Overlay.NowPlaying, Overlay.Video, Overlay.Photo)) {
+            moveTaskToBack(true)
+        }
+        overlay = next
     }
 
     /** Shows the AirPlay pairing PIN over the full screen during SRP pair-setup. */
