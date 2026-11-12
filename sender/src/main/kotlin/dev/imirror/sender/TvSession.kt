@@ -8,9 +8,10 @@ import java.net.InetSocketAddress
 import java.net.Socket
 
 /**
- * One video playback on the TV over a single kept-open connection. The receiver ends URL playback
- * when the sender's connection closes, so this socket must live for as long as the video plays.
- * Blocking; call off the main thread.
+ * AirPlay calls to the iMirror receiver over raw sockets we close ourselves. The receiver serves one
+ * connection at a time, so a pooled keep-alive connection (HttpURLConnection) blocks every later call.
+ * A video is one [TvSession] kept open for the whole playback: the receiver ends URL playback when
+ * the sender's connection closes. Blocking; call off the main thread.
  */
 class TvSession private constructor(private val socket: Socket) : Closeable {
     private val input = socket.getInputStream().buffered()
@@ -25,7 +26,9 @@ class TvSession private constructor(private val socket: Socket) : Closeable {
         close()
     }
 
-    override fun close() = runCatching { socket.close() }.let { }
+    override fun close() {
+        runCatching { socket.close() }
+    }
 
     private fun request(method: String, path: String, contentType: String? = null, body: ByteArray = ByteArray(0)): String {
         val head = buildString {
@@ -42,13 +45,22 @@ class TvSession private constructor(private val socket: Socket) : Closeable {
     }
 
     companion object {
+        /** Shows a photo; one request on its own connection (the photo stays up after it closes). */
+        /** GET /server-info body, for telling the receiver apart from other things on port 7000. */
+        fun serverInfo(tv: TvEndpoint, connectTimeoutMs: Int): String =
+            open(tv, connectTimeoutMs).use { it.request("GET", "/server-info") }
+
+        fun putPhoto(tv: TvEndpoint, jpeg: ByteArray) {
+            open(tv).use { it.request("PUT", "/photo", "image/jpeg", jpeg) }
+        }
+
+        fun clearPhoto(tv: TvEndpoint) {
+            open(tv).use { it.request("DELETE", "/photo") }
+        }
+
         /** Connects and asks the TV to play [mediaUrl]; the receiver reads this legacy text body. */
-        fun play(tv: TvEndpoint, mediaUrl: String): TvSession {
-            val socket = Socket().apply {
-                connect(InetSocketAddress(tv.host, tv.port), 3_000)
-                soTimeout = 15_000
-            }
-            return TvSession(socket).also {
+        fun play(tv: TvEndpoint, mediaUrl: String): TvSession =
+            open(tv).also {
                 try {
                     it.request("POST", "/play", "text/parameters", "Content-Location: $mediaUrl\r\nStart-Position: 0\r\n".toByteArray())
                 } catch (e: IOException) {
@@ -56,7 +68,13 @@ class TvSession private constructor(private val socket: Socket) : Closeable {
                     throw e
                 }
             }
-        }
+
+        private fun open(tv: TvEndpoint, connectTimeoutMs: Int = 3_000) = TvSession(
+            Socket().apply {
+                connect(InetSocketAddress(tv.host, tv.port), connectTimeoutMs)
+                soTimeout = 15_000
+            },
+        )
     }
 }
 

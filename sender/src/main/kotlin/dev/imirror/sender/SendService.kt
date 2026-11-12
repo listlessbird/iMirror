@@ -17,6 +17,7 @@ import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import android.os.SystemClock
+import android.util.Log
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -29,6 +30,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.security.SecureRandom
 
+private const val TAG = "ShareToTv"
 private const val CHANNEL_ID = "share_to_tv"
 private const val NOTIFICATION_ID = 1
 private const val ACTION_STOP = "dev.imirror.sender.STOP"
@@ -75,6 +77,7 @@ class SendService : Service() {
                 }
             } catch (e: Exception) {
                 if (!isActive) return@launch
+                Log.e(TAG, "send failed", e)
                 toast("TV: ${e.message ?: e.javaClass.simpleName}")
                 stopSelf()
             }
@@ -89,7 +92,7 @@ class SendService : Service() {
 
     private suspend fun sendPhoto(item: Shareable.Photo) {
         val endpoint = findTv(this) ?: return fail("TV not found")
-        TvClient.putPhoto(endpoint, encodePhotoForTv(contentResolver, item.uri))
+        TvSession.putPhoto(endpoint, encodePhotoForTv(contentResolver, item.uri))
         photoOn = endpoint
         startForeground("Showing on TV", stopLabel = "Close")
     }
@@ -144,7 +147,7 @@ class SendService : Service() {
         closeServer()
         scope.launch {
             tv?.stop()
-            if (photo != null) runCatching { TvClient.clearPhoto(photo) }
+            if (photo != null) runCatching { TvSession.clearPhoto(photo) }
             stopSelf()
         }
     }
@@ -170,13 +173,17 @@ class SendService : Service() {
     }
 
     private fun fail(message: String) {
+        Log.w(TAG, message)
         toast(message)
         stopSelf()
     }
 
     private fun toast(message: String) = main.post { Toast.makeText(this, message, Toast.LENGTH_LONG).show() }
 
-    /** [stopLabel] adds that action (and makes dismissing the notification do the same); null for none. */
+    /**
+     * [stopLabel] adds that action; tapping or dismissing the notification does the same, since some
+     * phones (vivo) collapse low-priority notifications and hide their buttons. Null for none.
+     */
     private fun startForeground(text: String, stopLabel: String?) {
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(NotificationChannel(CHANNEL_ID, "Share to TV", NotificationManager.IMPORTANCE_LOW))
@@ -189,7 +196,10 @@ class SendService : Service() {
             val stop = PendingIntent.getService(
                 this, 0, Intent(this, SendService::class.java).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE,
             )
-            builder.addAction(0, stopLabel, stop).setDeleteIntent(stop)
+            builder.addAction(0, stopLabel, stop)
+                .setContentText("Tap to ${stopLabel.lowercase()}")
+                .setContentIntent(stop)
+                .setDeleteIntent(stop)
         }
         ServiceCompat.startForeground(this, NOTIFICATION_ID, builder.build(), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
     }
