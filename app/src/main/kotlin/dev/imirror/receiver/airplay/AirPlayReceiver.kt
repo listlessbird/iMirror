@@ -1,6 +1,8 @@
 package dev.imirror.receiver.airplay
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.view.Surface
 import dev.imirror.receiver.airplay.handshake.AirPlayNtpClient
 import dev.imirror.receiver.airplay.handshake.AudioStreamServer
@@ -14,7 +16,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.ServerSocket
@@ -208,7 +209,9 @@ class AirPlayReceiver(
     private fun startMdnsService() {
         mdnsService = MdnsService(
             context = context,
-            onStateChange = { state -> emitState(state) },
+            // mDNS re-registration finishes a second or two after a connection closes. If a new
+            // session has started by then, its late ADVERTISING must not hide the session UI.
+            onStateChange = { state -> if (!(state == ProtocolState.ADVERTISING && connected)) emitState(state) },
             onActualNameRegistered = { actualName -> onActualNameRegistered(actualName) }
         ).also { it.start(displayName.ifBlank { null }) }
         Logger.d("mDNS service started")
@@ -592,14 +595,19 @@ class AirPlayReceiver(
 
     // ─── Private: state emission ─────────────────────────────────────────────
 
-    /** Dispatches [state] on the Main thread (Android UI rule). */
+    /** True from CONNECTED until the next other state; set on the calling thread, before dispatch. */
+    @Volatile private var connected = false
+
+    /**
+     * Dispatches [state] on the Main thread (Android UI rule). Handler.post keeps call order, so a
+     * session ending and the next one starting a moment later can't arrive swapped.
+     */
     private fun emitState(state: ProtocolState) {
-        scope.launch {
-            withContext(Dispatchers.Main) {
-                onStateChanged(state)
-            }
-        }
+        connected = state == ProtocolState.CONNECTED
+        mainHandler.post { if (scope.isActive) onStateChanged(state) }
     }
+
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     companion object {
         // Hint dimensions for MediaCodec configuration.
