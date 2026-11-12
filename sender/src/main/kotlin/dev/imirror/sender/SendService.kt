@@ -36,8 +36,9 @@ private const val POLL_MS = 2_000L
 private const val PREPARE_LIMIT_MS = 60_000L
 
 /**
- * Foreground service so the work outlives the invisible share activity. A photo is one upload.
- * A video runs a [MediaServer] on the phone and holds a [TvSession] open until the TV finishes or Stop.
+ * Foreground service so the work outlives the invisible share activity. A photo is one upload, then the
+ * notification stays as its Close button. A video runs a [MediaServer] on the phone and holds a
+ * [TvSession] open until the TV finishes or Stop. Dismissing the notification also stops either.
  */
 class SendService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -45,6 +46,7 @@ class SendService : Service() {
     private var job: Job? = null
     private var server: MediaServer? = null
     @Volatile private var session: TvSession? = null
+    @Volatile private var photoOn: TvEndpoint? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
 
@@ -62,8 +64,9 @@ class SendService : Service() {
         }
         // A new share replaces whatever was running.
         job?.cancel()
+        photoOn = null
         closeServer()
-        startForeground("Sending to TV", withStop = false)
+        startForeground("Sending to TV", stopLabel = null)
         job = scope.launch {
             try {
                 when (item) {
@@ -87,7 +90,8 @@ class SendService : Service() {
     private suspend fun sendPhoto(item: Shareable.Photo) {
         val endpoint = findTv(this) ?: return fail("TV not found")
         TvClient.putPhoto(endpoint, encodePhotoForTv(contentResolver, item.uri))
-        stopSelf()
+        photoOn = endpoint
+        startForeground("Showing on TV", stopLabel = "Close")
     }
 
     private suspend fun playVideo(item: Shareable.Video) {
@@ -109,7 +113,7 @@ class SendService : Service() {
 
         val tv = TvSession.play(endpoint, "http://${phone.hostAddress}:${media.port}/$token")
         session = tv
-        startForeground("Playing on TV", withStop = true)
+        startForeground("Playing on TV", stopLabel = "Stop")
 
         // The TV reports not-ready while preparing and again once the video has ended.
         val startedAt = SystemClock.elapsedRealtime()
@@ -130,14 +134,17 @@ class SendService : Service() {
             checkNotNull(contentResolver.openFileDescriptor(uri, "r")) { "provider returned no file" },
         ).channel
 
-    /** Stops the TV and tears down; runs on [scope] so it survives cancelling the playback job. */
+    /** Takes the video or photo off the TV and tears down; runs on [scope] so it survives cancelling the job. */
     private fun stopPlayback() {
         job?.cancel()
         val tv = session
+        val photo = photoOn
         session = null // stopped below, after closeServer() would otherwise just drop it
+        photoOn = null
         closeServer()
         scope.launch {
             tv?.stop()
+            if (photo != null) runCatching { TvClient.clearPhoto(photo) }
             stopSelf()
         }
     }
@@ -169,7 +176,8 @@ class SendService : Service() {
 
     private fun toast(message: String) = main.post { Toast.makeText(this, message, Toast.LENGTH_LONG).show() }
 
-    private fun startForeground(text: String, withStop: Boolean) {
+    /** [stopLabel] adds that action (and makes dismissing the notification do the same); null for none. */
+    private fun startForeground(text: String, stopLabel: String?) {
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(NotificationChannel(CHANNEL_ID, "Share to TV", NotificationManager.IMPORTANCE_LOW))
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
@@ -177,11 +185,11 @@ class SendService : Service() {
             .setContentTitle(text)
             .setOngoing(true)
             .setCategory(Notification.CATEGORY_SERVICE)
-        if (withStop) {
+        if (stopLabel != null) {
             val stop = PendingIntent.getService(
                 this, 0, Intent(this, SendService::class.java).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE,
             )
-            builder.addAction(0, "Stop", stop)
+            builder.addAction(0, stopLabel, stop).setDeleteIntent(stop)
         }
         ServiceCompat.startForeground(this, NOTIFICATION_ID, builder.build(), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
     }
