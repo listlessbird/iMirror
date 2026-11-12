@@ -28,19 +28,27 @@ class AirPlayVideoPlayer(
     private val surfaceProvider: () -> Surface?,
     private val onEnded: () -> Unit = {},
 ) {
-    private var mp: MediaPlayer? = null
-    @Volatile private var prepared = false
-    @Volatile private var startFraction = 0.0
+    /**
+     * MediaPlayer only accepts start/pause/seek once prepared, so control verbs that arrive while
+     * preparing (senders send `/rate` right after `/play`) are recorded and applied in [onPrepared].
+     */
+    private sealed interface State {
+        val mp: MediaPlayer?
+        data object Idle : State { override val mp: MediaPlayer? = null }
+        class Preparing(override val mp: MediaPlayer, var seekMs: Int?, var startFraction: Double, var playing: Boolean) : State
+        class Ready(override val mp: MediaPlayer) : State
+    }
+
+    private var state: State = State.Idle
 
     /** Starts playing [url], seeking to [startPositionFraction] (0..1 of duration) once prepared. */
     @Synchronized
     fun play(url: String, startPositionFraction: Double) {
         release()
-        startFraction = startPositionFraction.coerceIn(0.0, 1.0)
-        Logger.i("AirPlay video: play url=$url start=$startFraction")
+        val fraction = startPositionFraction.coerceIn(0.0, 1.0)
+        Logger.i("AirPlay video: play url=$url start=$fraction")
         val player = MediaPlayer()
-        mp = player
-        prepared = false
+        state = State.Preparing(player, seekMs = null, startFraction = fraction, playing = true)
         runCatching {
             player.setAudioAttributes(
                 AudioAttributes.Builder()
@@ -55,68 +63,85 @@ class AirPlayVideoPlayer(
                 StreamStats.videoWidth = w
                 StreamStats.videoHeight = h
             }
-            player.setOnCompletionListener { Logger.i("AirPlay video: completed"); onEnded() }
-            player.setOnErrorListener { _, what, extra ->
+            player.setOnCompletionListener { if (owns(it)) { Logger.i("AirPlay video: completed"); onEnded() } }
+            // An error ends the session too; otherwise the TV sits on a black screen.
+            player.setOnErrorListener { mp, what, extra ->
                 Logger.e("AirPlay video error what=$what extra=$extra")
-                true   // handled — don't also fire onCompletion
+                if (owns(mp)) onEnded()
+                true
             }
             player.setDataSource(url)
             player.prepareAsync()
-        }.onFailure { Logger.e("AirPlay video: setup failed", it); release() }
+        }.onFailure { Logger.e("AirPlay video: setup failed", it); release(); onEnded() }
     }
+
+    /** False for callbacks from a player already released or replaced. */
+    @Synchronized
+    private fun owns(player: MediaPlayer) = state.mp === player
 
     @Synchronized
     private fun onPrepared(player: MediaPlayer) {
-        // onPrepared fires on MediaPlayer's own thread and can race release()/a new play(): if the
-        // player was released (or replaced) while preparing, mp no longer points at it — bail before
-        // touching a dead MediaPlayer (which would throw IllegalStateException).
-        if (mp !== player) return
+        val s = state as? State.Preparing ?: return
+        if (s.mp !== player) return
         // The Surface usually doesn't exist at setDataSource() time (the Activity creates it only
         // after CONNECTED) — attach it now that prepare has completed.
         surfaceProvider()?.let { runCatching { player.setSurface(it) } }
-        if (startFraction > 0.0) runCatching { player.seekTo((startFraction * player.duration).toInt()) }
-        prepared = true
-        runCatching { player.start() }
-        Logger.i("AirPlay video: prepared dur=${runCatching { player.duration }.getOrDefault(0)}ms → playing")
+        val seekMs = s.seekMs ?: (s.startFraction * player.duration).toInt().takeIf { it > 0 }
+        seekMs?.let { runCatching { player.seekTo(it) } }
+        state = State.Ready(player)
+        if (s.playing) runCatching { player.start() }
+        Logger.i("AirPlay video: prepared dur=${runCatching { player.duration }.getOrDefault(0)}ms playing=${s.playing}")
     }
 
     /** rate ≤ 0 pauses, > 0 resumes. */
     @Synchronized
     fun setRate(rate: Float) {
-        val player = mp ?: return
-        runCatching {
-            if (rate <= 0f) { if (player.isPlaying) player.pause() }
-            else { if (!player.isPlaying) player.start() }
+        when (val s = state) {
+            is State.Preparing -> s.playing = rate > 0f
+            is State.Ready -> runCatching {
+                if (rate <= 0f) { if (s.mp.isPlaying) s.mp.pause() }
+                else { if (!s.mp.isPlaying) s.mp.start() }
+            }
+            State.Idle -> Unit
         }
     }
 
     /** Seeks to [positionSec] seconds. */
     @Synchronized
     fun scrub(positionSec: Double) {
-        runCatching { mp?.seekTo((positionSec * 1000).toInt()) }
+        val ms = (positionSec * 1000).toInt()
+        when (val s = state) {
+            is State.Preparing -> s.seekMs = ms
+            is State.Ready -> runCatching { s.mp.seekTo(ms) }
+            State.Idle -> Unit
+        }
     }
 
     /** Current playback snapshot for `/playback-info`, or null if nothing is loaded. */
     @Synchronized
-    fun info(): PlaybackInfo? {
-        val player = mp ?: return null
-        if (!prepared) return PlaybackInfo(0.0, 0.0, 0.0, readyToPlay = false)
-        val dur = runCatching { player.duration }.getOrDefault(0)
-        val pos = runCatching { player.currentPosition }.getOrDefault(0)
-        val playing = runCatching { player.isPlaying }.getOrDefault(false)
-        return PlaybackInfo(dur / 1000.0, pos / 1000.0, if (playing) 1.0 else 0.0, readyToPlay = true)
+    fun info(): PlaybackInfo? = when (val s = state) {
+        State.Idle -> null
+        is State.Preparing -> PlaybackInfo(0.0, 0.0, 0.0, readyToPlay = false)
+        is State.Ready -> {
+            val dur = runCatching { s.mp.duration }.getOrDefault(0)
+            val pos = runCatching { s.mp.currentPosition }.getOrDefault(0)
+            val playing = runCatching { s.mp.isPlaying }.getOrDefault(false)
+            PlaybackInfo(dur / 1000.0, pos / 1000.0, if (playing) 1.0 else 0.0, readyToPlay = true)
+        }
     }
 
     /** Re-attach the streaming surface (after the Activity recreates it on foreground). */
     @Synchronized
     fun attachSurface() {
-        surfaceProvider()?.let { runCatching { mp?.setSurface(it) } }
+        val player = state.mp ?: return
+        surfaceProvider()?.let { runCatching { player.setSurface(it) } }
     }
 
     @Synchronized
     fun release() {
-        mp?.let { p -> runCatching { p.stop() }; runCatching { p.release() } }
-        mp = null
-        prepared = false
+        val player = state.mp ?: return
+        state = State.Idle
+        runCatching { player.stop() }
+        runCatching { player.release() }
     }
 }
