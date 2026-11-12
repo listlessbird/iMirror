@@ -271,24 +271,25 @@ class AirPlayReceiver(
         Logger.i("Streaming started — video=${session.hasVideo} audio=${session.hasAudio} " +
                  "audioOnly=${session.isAudioOnly}")
 
-        scope.launch {
-            try {
-                if (session.hasVideo) startVideoDecoder(session)
-                if (session.hasAudio) startAudioPlayer(session)
-                // Legacy (SDP) session: reflect its stream kinds into now-playing state so an
-                // audio-only RAOP session shows the now-playing card.
-                npSenderName = session.senderName.ifBlank { npSenderName }
-                videoPlaying = session.hasVideo
-                audioPlaying = session.hasAudio
-                emitNowPlaying()
-                // Notify MirrorService of the sender name BEFORE emitting CONNECTED,
-                // so the name is ready when the ActiveConnection is created.
-                onSenderNameChanged(session.senderName)
-                setInSession(true)
-            } catch (e: Exception) {
-                Logger.e("Failed to start media pipeline", e)
-                setInSession(false)
-            }
+        // Synchronous on the RTSP connection thread: that thread also runs the close cleanup
+        // (onStreamingStopped), so a session can't end before its pipeline exists and then have a
+        // late setup leak a decoder and leave the UI stuck on CONNECTED.
+        try {
+            if (session.hasVideo) startVideoDecoder(session)
+            if (session.hasAudio) startAudioPlayer(session)
+            // Legacy (SDP) session: reflect its stream kinds into now-playing state so an
+            // audio-only RAOP session shows the now-playing card.
+            npSenderName = session.senderName.ifBlank { npSenderName }
+            videoPlaying = session.hasVideo
+            audioPlaying = session.hasAudio
+            emitNowPlaying()
+            // Notify MirrorService of the sender name BEFORE emitting CONNECTED,
+            // so the name is ready when the ActiveConnection is created.
+            onSenderNameChanged(session.senderName)
+            setInSession(true)
+        } catch (e: Exception) {
+            Logger.e("Failed to start media pipeline", e)
+            setInSession(false)
         }
     }
 
