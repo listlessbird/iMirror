@@ -7,6 +7,9 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
@@ -300,6 +303,7 @@ class MirrorService : Service() {
                 _airPlayState.value = state
                 when (state) {
                     ProtocolState.CONNECTED   -> {
+                        pauseOtherMedia(true)
                         _photoFrame.value = null
                         _activeConnection.value =
                             ActiveConnection(pendingSenderName, Protocol.AIRPLAY)
@@ -309,6 +313,7 @@ class MirrorService : Service() {
                     ProtocolState.ADVERTISING,
                     ProtocolState.DISABLED,
                     ProtocolState.ERROR       -> {
+                        pauseOtherMedia(false)
                         _activeConnection.value = null
                         updateNotification(isRunning = state != ProtocolState.DISABLED &&
                                                        state != ProtocolState.ERROR)
@@ -319,9 +324,30 @@ class MirrorService : Service() {
         Logger.d("AirPlay receiver started (displayName='${settings.effectiveDisplayName}')")
     }
 
+    /**
+     * Transient focus makes other apps (Spotify, YouTube) pause while a sender is on screen and
+     * resume on their own when we abandon it. Both calls are no-ops when repeated.
+     */
+    private val otherMediaPause by lazy {
+        AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                    .build()
+            )
+            .build()
+    }
+
+    private fun pauseOtherMedia(pause: Boolean) {
+        val audio = getSystemService(AudioManager::class.java)
+        if (pause) audio.requestAudioFocus(otherMediaPause) else audio.abandonAudioFocusRequest(otherMediaPause)
+    }
+
     private fun stopAllReceiversInternal() {
         try { airPlayReceiver?.stop() } catch (e: Exception) { Logger.e("AirPlay stop error", e) }
         airPlayReceiver = null
+        pauseOtherMedia(false)
         _airPlayState.value = ProtocolState.DISABLED
         _photoFrame.value = null
         _nowPlaying.value = null
